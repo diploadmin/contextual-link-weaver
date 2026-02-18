@@ -2,8 +2,8 @@
 /**
  * Plugin Name:       Contextual Link Weaver
  * Plugin URI:        https://github.com/geosem42/contextual-link-weaver
- * Description:       Uses the Gemini API to provide intelligent, context-aware internal linking suggestions.
- * Version:           1.0.0
+ * Description:       Uses Google Gemini or a local OpenAI-compatible LLM to provide intelligent internal linking suggestions.
+ * Version:           1.2.0
  * Author:            George Semaan
  * Author URI:        https://logicvoid.dev
  * License:           GPL v2 or later
@@ -15,22 +15,15 @@ if ( ! defined( 'ABSPATH' ) ) {
 	exit;
 }
 
-// Include the separate file that handles the Gemini API communication.
+// Include the file that handles LLM API communication.
 require_once plugin_dir_path( __FILE__ ) . 'includes/gemini-api.php';
 
 /*
-|--------------------------------------------------------------------------
-| Admin Settings Page
-|--------------------------------------------------------------------------
-|
-| This section creates the settings page in the WordPress admin area
-| where the user can enter their Gemini API key.
-|
+||--------------------------------------------------------------------------
+|| Admin Settings Page
+||--------------------------------------------------------------------------
 */
 
-/**
- * Adds the settings page to the admin menu.
- */
 function clw_add_admin_menu() {
 	add_options_page(
 		'Contextual Link Weaver Settings',
@@ -42,84 +35,158 @@ function clw_add_admin_menu() {
 }
 add_action( 'admin_menu', 'clw_add_admin_menu' );
 
-/**
- * Initializes the settings, sections, and fields for the admin page.
- */
 function clw_settings_init() {
+	// Provider selector
+	register_setting( 'clw_settings_group', 'clw_llm_provider', [
+		'sanitize_callback' => 'sanitize_text_field',
+		'type'              => 'string',
+		'default'           => 'gemini',
+	] );
+
+	// Gemini settings
 	register_setting( 'clw_settings_group', 'clw_gemini_api_key', [
 		'sanitize_callback' => 'sanitize_text_field',
 		'type'              => 'string',
 	] );
 
-	add_settings_section(
-		'clw_api_settings_section',
-		'API Settings',
-		'clw_api_settings_section_callback',
-		'contextual-link-weaver'
-	);
+	// Local LLM settings
+	register_setting( 'clw_settings_group', 'clw_llm_url', [
+		'sanitize_callback' => 'sanitize_text_field',
+		'type'              => 'string',
+	] );
+	register_setting( 'clw_settings_group', 'clw_llm_model', [
+		'sanitize_callback' => 'sanitize_text_field',
+		'type'              => 'string',
+	] );
+	register_setting( 'clw_settings_group', 'clw_llm_key', [
+		'sanitize_callback' => 'sanitize_text_field',
+		'type'              => 'string',
+	] );
 
-	add_settings_field(
-		'clw_gemini_api_key_field',
-		'Gemini API Key',
-		'clw_api_key_field_callback',
-		'contextual-link-weaver',
-		'clw_api_settings_section'
-	);
+	add_settings_section( 'clw_provider_section', 'LLM Provider',                          '__return_false', 'contextual-link-weaver' );
+	add_settings_section( 'clw_gemini_section',   'Google Gemini',                          '__return_false', 'contextual-link-weaver' );
+	add_settings_section( 'clw_local_section',    'Local / Custom LLM (OpenAI-compatible)', '__return_false', 'contextual-link-weaver' );
+
+	add_settings_field( 'clw_llm_provider_field',   'Active Provider', 'clw_provider_field_callback',    'contextual-link-weaver', 'clw_provider_section' );
+	add_settings_field( 'clw_gemini_api_key_field',  'Gemini API Key',  'clw_gemini_key_field_callback',  'contextual-link-weaver', 'clw_gemini_section' );
+	add_settings_field( 'clw_llm_url_field',         'Base URL',        'clw_llm_url_field_callback',     'contextual-link-weaver', 'clw_local_section' );
+	add_settings_field( 'clw_llm_model_field',       'Model Name',      'clw_llm_model_field_callback',   'contextual-link-weaver', 'clw_local_section' );
+	add_settings_field( 'clw_llm_key_field',         'API Key',         'clw_llm_key_field_callback',     'contextual-link-weaver', 'clw_local_section' );
 }
 add_action( 'admin_init', 'clw_settings_init' );
 
-/**
- * Renders the description for the API settings section.
- */
-function clw_api_settings_section_callback() {
-	echo '<p>Enter your Google Gemini API key below to enable link suggestions.</p>';
+function clw_provider_field_callback() {
+	$value = get_option( 'clw_llm_provider', 'gemini' );
+	?>
+	<select name="clw_llm_provider" id="clw_llm_provider" onchange="clwToggleSections(this.value)" style="min-width:220px">
+		<option value="gemini" <?php selected( $value, 'gemini' ); ?>>Google Gemini</option>
+		<option value="local"  <?php selected( $value, 'local' ); ?>>Local / Custom LLM</option>
+	</select>
+	<script>
+	function clwToggleSections(provider) {
+		var gemini = document.getElementById('clw-gemini-section');
+		var local  = document.getElementById('clw-local-section');
+		if (gemini) gemini.style.display = provider === 'gemini' ? '' : 'none';
+		if (local)  local.style.display  = provider === 'local'  ? '' : 'none';
+	}
+	document.addEventListener('DOMContentLoaded', function() {
+		clwToggleSections(document.getElementById('clw_llm_provider').value);
+	});
+	</script>
+	<?php
 }
 
-/**
- * Renders the input field for the API key.
- */
-function clw_api_key_field_callback() {
-	$api_key = get_option( 'clw_gemini_api_key' );
+function clw_gemini_key_field_callback() {
+	$value = get_option( 'clw_gemini_api_key' );
 	printf(
-		'<input type="password" name="clw_gemini_api_key" value="%s" size="50" />',
-		esc_attr( $api_key )
+		'<input type="password" name="clw_gemini_api_key" value="%s" size="60" /><p class="description">Get your free key at <a href="https://aistudio.google.com/app/apikey" target="_blank">Google AI Studio</a>. Uses model <code>gemini-2.5-flash</code>.</p>',
+		esc_attr( $value )
 	);
 }
 
-/**
- * Renders the HTML for the main settings page.
- */
+function clw_llm_url_field_callback() {
+	$value = get_option( 'clw_llm_url' );
+	printf(
+		'<input type="text" name="clw_llm_url" value="%s" size="60" placeholder="https://chatgpt-oss.mydepartment.ai/v1" /><p class="description">Base URL including <code>/v1</code>. The plugin appends <code>/chat/completions</code>.</p>',
+		esc_attr( $value )
+	);
+}
+
+function clw_llm_model_field_callback() {
+	$value = get_option( 'clw_llm_model' );
+	printf(
+		'<input type="text" name="clw_llm_model" value="%s" size="40" placeholder="openai/gpt-oss-20b" />',
+		esc_attr( $value )
+	);
+}
+
+function clw_llm_key_field_callback() {
+	$value = get_option( 'clw_llm_key' );
+	printf(
+		'<input type="password" name="clw_llm_key" value="%s" size="50" /><p class="description">Leave empty if your endpoint does not require authentication.</p>',
+		esc_attr( $value )
+	);
+}
+
 function clw_settings_page_html() {
 	if ( ! current_user_can( 'manage_options' ) ) {
 		return;
 	}
+	$provider = get_option( 'clw_llm_provider', 'gemini' );
 	?>
 	<div class="wrap">
 		<h1><?php echo esc_html( get_admin_page_title() ); ?></h1>
 		<form action="options.php" method="post">
-			<?php
-			settings_fields( 'clw_settings_group' );
-			do_settings_sections( 'contextual-link-weaver' );
-			submit_button( 'Save Settings' );
-			?>
+			<?php settings_fields( 'clw_settings_group' ); ?>
+
+			<h2><?php esc_html_e( 'LLM Provider', 'contextual-link-weaver' ); ?></h2>
+			<table class="form-table" role="presentation">
+				<tr>
+					<th scope="row"><label for="clw_llm_provider"><?php esc_html_e( 'Active Provider', 'contextual-link-weaver' ); ?></label></th>
+					<td><?php clw_provider_field_callback(); ?></td>
+				</tr>
+			</table>
+
+			<div id="clw-gemini-section" style="display:<?php echo $provider === 'gemini' ? '' : 'none'; ?>">
+				<h2><?php esc_html_e( 'Google Gemini', 'contextual-link-weaver' ); ?></h2>
+				<table class="form-table" role="presentation">
+					<tr>
+						<th scope="row"><label for="clw_gemini_api_key"><?php esc_html_e( 'Gemini API Key', 'contextual-link-weaver' ); ?></label></th>
+						<td><?php clw_gemini_key_field_callback(); ?></td>
+					</tr>
+				</table>
+			</div>
+
+			<div id="clw-local-section" style="display:<?php echo $provider === 'local' ? '' : 'none'; ?>">
+				<h2><?php esc_html_e( 'Local / Custom LLM (OpenAI-compatible)', 'contextual-link-weaver' ); ?></h2>
+				<table class="form-table" role="presentation">
+					<tr>
+						<th scope="row"><label for="clw_llm_url"><?php esc_html_e( 'Base URL', 'contextual-link-weaver' ); ?></label></th>
+						<td><?php clw_llm_url_field_callback(); ?></td>
+					</tr>
+					<tr>
+						<th scope="row"><label for="clw_llm_model"><?php esc_html_e( 'Model Name', 'contextual-link-weaver' ); ?></label></th>
+						<td><?php clw_llm_model_field_callback(); ?></td>
+					</tr>
+					<tr>
+						<th scope="row"><label for="clw_llm_key"><?php esc_html_e( 'API Key', 'contextual-link-weaver' ); ?></label></th>
+						<td><?php clw_llm_key_field_callback(); ?></td>
+					</tr>
+				</table>
+			</div>
+
+			<?php submit_button( 'Save Settings' ); ?>
 		</form>
 	</div>
 	<?php
 }
 
 /*
-|--------------------------------------------------------------------------
-| Gutenberg Editor Integration
-|--------------------------------------------------------------------------
-|
-| This section handles loading the JavaScript for the editor sidebar
-| and creating the REST API endpoint for communication.
-|
+||--------------------------------------------------------------------------
+|| Gutenberg Editor Integration
+||--------------------------------------------------------------------------
 */
 
-/**
- * Enqueues the JavaScript assets for the block editor.
- */
 function clw_enqueue_editor_assets() {
 	$asset_file_path = plugin_dir_path( __FILE__ ) . 'build/index.asset.php';
 
@@ -138,9 +205,6 @@ function clw_enqueue_editor_assets() {
 }
 add_action( 'enqueue_block_editor_assets', 'clw_enqueue_editor_assets' );
 
-/**
- * Registers the custom REST API route for getting suggestions.
- */
 function clw_register_rest_route() {
 	register_rest_route(
 		'contextual-link-weaver/v1',
@@ -158,9 +222,6 @@ add_action( 'rest_api_init', 'clw_register_rest_route' );
 
 /**
  * Handles the incoming request from the editor to generate link suggestions.
- *
- * @param WP_REST_Request $request The request object from the REST API.
- * @return WP_REST_Response The response containing suggestions or an error.
  */
 function clw_handle_suggestions_request( WP_REST_Request $request ) {
 	$post_content = $request->get_param( 'content' );
@@ -211,9 +272,9 @@ function clw_handle_suggestions_request( WP_REST_Request $request ) {
     4.  Find up to 5 of the best possible linking opportunities, then find the single most contextually relevant article from the JSON list for each one.
     5.  NEVER use the title of an article from the JSON list as the 'anchor_text' unless that exact phrase also appears in the draft article.
 
-    Return your answer ONLY as a valid JSON array of objects. Each object must have three keys: 'anchor_text', 'post_id_to_link', and 'reasoning'. If you cannot find any good matches that follow all the rules, return an empty array [].";
+    Return your answer ONLY as a JSON object with a single key 'suggestions' whose value is an array of objects. Each object must have three keys: 'anchor_text', 'post_id_to_link', and 'reasoning'. If you cannot find any good matches that follow all the rules, return {\"suggestions\": []}.";
 
-	$suggestions_from_api = get_gemini_linking_suggestions( $prompt );
+	$suggestions_from_api = clw_get_linking_suggestions( $prompt );
 
 	if ( is_wp_error( $suggestions_from_api ) ) {
 		return new WP_REST_Response( [ 'error' => $suggestions_from_api->get_error_message() ], 500 );
@@ -223,12 +284,17 @@ function clw_handle_suggestions_request( WP_REST_Request $request ) {
 		return new WP_REST_Response( [ 'error' => 'API returned a non-array response.' ], 500 );
 	}
 
+	// Unwrap {"suggestions": [...]} envelope if present.
+	if ( isset( $suggestions_from_api['suggestions'] ) && is_array( $suggestions_from_api['suggestions'] ) ) {
+		$suggestions_from_api = $suggestions_from_api['suggestions'];
+	}
+
 	$final_suggestions = [];
 	foreach ( $suggestions_from_api as $suggestion ) {
 		foreach ( $post_list as $post ) {
 			if ( $post['id'] == $suggestion['post_id_to_link'] ) {
-				$suggestion['title']       = $post['title'];
-				$suggestion['url']         = $post['url'];
+				$suggestion['title'] = $post['title'];
+				$suggestion['url']   = $post['url'];
 				$final_suggestions[] = $suggestion;
 				break;
 			}
