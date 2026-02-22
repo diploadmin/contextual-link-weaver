@@ -206,17 +206,21 @@ function clw_enqueue_editor_assets() {
 add_action( 'enqueue_block_editor_assets', 'clw_enqueue_editor_assets' );
 
 function clw_register_rest_route() {
-	register_rest_route(
-		'contextual-link-weaver/v1',
-		'/suggestions',
-		[
-			'methods'             => 'POST',
-			'callback'            => 'clw_handle_suggestions_request',
-			'permission_callback' => function () {
-				return current_user_can( 'edit_posts' );
-			},
-		]
-	);
+	$permission = function () { return current_user_can( 'edit_posts' ); };
+
+	// Full post scan — returns up to 5 anchor+link suggestions.
+	register_rest_route( 'contextual-link-weaver/v1', '/suggestions', [
+		'methods'             => 'POST',
+		'callback'            => 'clw_handle_suggestions_request',
+		'permission_callback' => $permission,
+	] );
+
+	// Selection-based — given a highlighted phrase, returns best matching posts.
+	register_rest_route( 'contextual-link-weaver/v1', '/link-for-text', [
+		'methods'             => 'POST',
+		'callback'            => 'clw_handle_link_for_text_request',
+		'permission_callback' => $permission,
+	] );
 }
 add_action( 'rest_api_init', 'clw_register_rest_route' );
 
@@ -302,4 +306,80 @@ function clw_handle_suggestions_request( WP_REST_Request $request ) {
 	}
 
 	return new WP_REST_Response( $final_suggestions, 200 );
+}
+
+/**
+ * Handles a selection-based request: given a highlighted phrase, returns the
+ * best matching posts to link to (no anchor text discovery needed).
+ */
+function clw_handle_link_for_text_request( WP_REST_Request $request ) {
+	$anchor_text     = trim( $request->get_param( 'anchor_text' ) );
+	$current_post_id = $request->get_param( 'post_id' );
+
+	if ( empty( $anchor_text ) ) {
+		return new WP_REST_Response( [ 'error' => 'anchor_text is required.' ], 400 );
+	}
+
+	$posts = get_posts( [
+		'numberposts' => -1,
+		'post_status' => 'publish',
+		'post_type'   => 'post',
+	] );
+
+	$post_list = [];
+	foreach ( $posts as $post ) {
+		if ( $post->ID == $current_post_id ) {
+			continue;
+		}
+		$post_list[ $post->ID ] = [
+			'id'    => $post->ID,
+			'title' => $post->post_title,
+			'url'   => get_permalink( $post->ID ),
+		];
+	}
+
+	if ( empty( $post_list ) ) {
+		return new WP_REST_Response( [], 200 );
+	}
+
+	$post_list_json = wp_json_encode( array_values( $post_list ) );
+
+	$prompt = "You are an expert SEO. A blog editor has selected the following phrase as a potential anchor text for an internal link:
+    \"{$anchor_text}\"
+
+    Here is a JSON list of all available articles to link to (including their 'id', 'title', and 'url'):
+    {$post_list_json}
+
+    Your task: Find the TOP 5 most contextually relevant articles that would be the best link targets for this specific anchor text phrase.
+
+    Return ONLY a JSON object with a single key 'suggestions' whose value is an array of objects. Each object must have exactly two keys: 'post_id' (integer) and 'reasoning' (brief explanation). Sort by relevance, most relevant first. If no suitable match exists, return {\"suggestions\": []}.";
+
+	$result = clw_get_linking_suggestions( $prompt );
+
+	if ( is_wp_error( $result ) ) {
+		return new WP_REST_Response( [ 'error' => $result->get_error_message() ], 500 );
+	}
+
+	if ( ! is_array( $result ) ) {
+		return new WP_REST_Response( [ 'error' => 'Invalid API response.' ], 500 );
+	}
+
+	if ( isset( $result['suggestions'] ) && is_array( $result['suggestions'] ) ) {
+		$result = $result['suggestions'];
+	}
+
+	$final = [];
+	foreach ( $result as $suggestion ) {
+		$pid = intval( $suggestion['post_id'] ?? 0 );
+		if ( $pid && isset( $post_list[ $pid ] ) ) {
+			$final[] = [
+				'post_id'   => $pid,
+				'title'     => $post_list[ $pid ]['title'],
+				'url'       => $post_list[ $pid ]['url'],
+				'reasoning' => $suggestion['reasoning'] ?? '',
+			];
+		}
+	}
+
+	return new WP_REST_Response( $final, 200 );
 }
