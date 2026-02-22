@@ -2,8 +2,8 @@
 /**
  * Plugin Name:       Contextual Link Weaver
  * Plugin URI:        https://github.com/geosem42/contextual-link-weaver
- * Description:       Uses Google Gemini or a local OpenAI-compatible LLM to provide intelligent internal linking suggestions.
- * Version:           1.2.0
+ * Description:       Uses Google Gemini or a local OpenAI-compatible LLM to provide intelligent internal linking suggestions, with optional RAG-based source discovery.
+ * Version:           1.3.0
  * Author:            George Semaan
  * Author URI:        https://logicvoid.dev
  * License:           GPL v2 or later
@@ -49,6 +49,12 @@ function clw_settings_init() {
 		'type'              => 'string',
 	] );
 
+	// RAG / Chatbot API settings
+	register_setting( 'clw_settings_group', 'clw_rag_api_url', [
+		'sanitize_callback' => 'sanitize_text_field',
+		'type'              => 'string',
+	] );
+
 	// Local LLM settings
 	register_setting( 'clw_settings_group', 'clw_llm_url', [
 		'sanitize_callback' => 'sanitize_text_field',
@@ -66,12 +72,14 @@ function clw_settings_init() {
 	add_settings_section( 'clw_provider_section', 'LLM Provider',                          '__return_false', 'contextual-link-weaver' );
 	add_settings_section( 'clw_gemini_section',   'Google Gemini',                          '__return_false', 'contextual-link-weaver' );
 	add_settings_section( 'clw_local_section',    'Local / Custom LLM (OpenAI-compatible)', '__return_false', 'contextual-link-weaver' );
+	add_settings_section( 'clw_rag_section',      'RAG / Chatbot API (Source Discovery)',   '__return_false', 'contextual-link-weaver' );
 
 	add_settings_field( 'clw_llm_provider_field',   'Active Provider', 'clw_provider_field_callback',    'contextual-link-weaver', 'clw_provider_section' );
 	add_settings_field( 'clw_gemini_api_key_field',  'Gemini API Key',  'clw_gemini_key_field_callback',  'contextual-link-weaver', 'clw_gemini_section' );
 	add_settings_field( 'clw_llm_url_field',         'Base URL',        'clw_llm_url_field_callback',     'contextual-link-weaver', 'clw_local_section' );
 	add_settings_field( 'clw_llm_model_field',       'Model Name',      'clw_llm_model_field_callback',   'contextual-link-weaver', 'clw_local_section' );
 	add_settings_field( 'clw_llm_key_field',         'API Key',         'clw_llm_key_field_callback',     'contextual-link-weaver', 'clw_local_section' );
+	add_settings_field( 'clw_rag_api_url_field',     'Chatbot API URL', 'clw_rag_url_field_callback',     'contextual-link-weaver', 'clw_rag_section' );
 }
 add_action( 'admin_init', 'clw_settings_init' );
 
@@ -128,6 +136,14 @@ function clw_llm_key_field_callback() {
 	);
 }
 
+function clw_rag_url_field_callback() {
+	$value = get_option( 'clw_rag_api_url' );
+	printf(
+		'<input type="text" name="clw_rag_api_url" value="%s" size="60" placeholder="https://chat-api.humainism.ai" /><p class="description">Base URL of the chatbot API (without trailing slash). When set, the toolbar button will also query this API for relevant sources.</p>',
+		esc_attr( $value )
+	);
+}
+
 function clw_settings_page_html() {
 	if ( ! current_user_can( 'manage_options' ) ) {
 		return;
@@ -171,6 +187,16 @@ function clw_settings_page_html() {
 					<tr>
 						<th scope="row"><label for="clw_llm_key"><?php esc_html_e( 'API Key', 'contextual-link-weaver' ); ?></label></th>
 						<td><?php clw_llm_key_field_callback(); ?></td>
+					</tr>
+				</table>
+			</div>
+
+			<div id="clw-rag-section">
+				<h2><?php esc_html_e( 'RAG / Chatbot API (Source Discovery)', 'contextual-link-weaver' ); ?></h2>
+				<table class="form-table" role="presentation">
+					<tr>
+						<th scope="row"><label for="clw_rag_api_url"><?php esc_html_e( 'Chatbot API URL', 'contextual-link-weaver' ); ?></label></th>
+						<td><?php clw_rag_url_field_callback(); ?></td>
 					</tr>
 				</table>
 			</div>
@@ -219,6 +245,13 @@ function clw_register_rest_route() {
 	register_rest_route( 'contextual-link-weaver/v1', '/link-for-text', [
 		'methods'             => 'POST',
 		'callback'            => 'clw_handle_link_for_text_request',
+		'permission_callback' => $permission,
+	] );
+
+	// RAG-based — queries chatbot API for relevant sources.
+	register_rest_route( 'contextual-link-weaver/v1', '/link-from-rag', [
+		'methods'             => 'POST',
+		'callback'            => 'clw_handle_link_from_rag_request',
 		'permission_callback' => $permission,
 	] );
 }
@@ -378,6 +411,84 @@ function clw_handle_link_for_text_request( WP_REST_Request $request ) {
 				'url'       => $post_list[ $pid ]['url'],
 				'reasoning' => $suggestion['reasoning'] ?? '',
 			];
+		}
+	}
+
+	return new WP_REST_Response( $final, 200 );
+}
+
+/**
+ * Queries the external chatbot RAG API for relevant sources given a text phrase.
+ */
+function clw_handle_link_from_rag_request( WP_REST_Request $request ) {
+	$query = trim( $request->get_param( 'query' ) );
+	if ( empty( $query ) ) {
+		return new WP_REST_Response( [ 'error' => 'query is required.' ], 400 );
+	}
+
+	$base_url = rtrim( get_option( 'clw_rag_api_url', '' ), '/' );
+	if ( empty( $base_url ) ) {
+		return new WP_REST_Response( [ 'error' => 'RAG Chatbot API URL is not configured.' ], 500 );
+	}
+
+	// Step 1: Get a fresh conversation ID.
+	$conv_response = wp_remote_post( $base_url . '/api/conversation/get_id', [
+		'headers' => [ 'Content-Type' => 'application/json' ],
+		'body'    => '{"conversation_id": null}',
+		'timeout' => 15,
+	] );
+
+	if ( is_wp_error( $conv_response ) ) {
+		return new WP_REST_Response( [ 'error' => 'Failed to connect to chatbot API: ' . $conv_response->get_error_message() ], 500 );
+	}
+
+	$conv_data       = json_decode( wp_remote_retrieve_body( $conv_response ), true );
+	$conversation_id = $conv_data['conversationId'] ?? null;
+
+	if ( ! $conversation_id ) {
+		return new WP_REST_Response( [ 'error' => 'Could not obtain conversation ID from chatbot API.' ], 500 );
+	}
+
+	// Step 2: Send the query and get sources.
+	$chat_response = wp_remote_post( $base_url . '/api/chat/' . $conversation_id, [
+		'headers' => [ 'Content-Type' => 'application/json' ],
+		'body'    => wp_json_encode( [
+			'user_ip'   => '127.0.0.1',
+			'message'   => $query,
+			'user_type' => 'general',
+		] ),
+		'timeout' => 60,
+	] );
+
+	if ( is_wp_error( $chat_response ) ) {
+		return new WP_REST_Response( [ 'error' => 'Chatbot API request failed: ' . $chat_response->get_error_message() ], 500 );
+	}
+
+	$status = wp_remote_retrieve_response_code( $chat_response );
+	if ( $status !== 200 ) {
+		return new WP_REST_Response( [ 'error' => "Chatbot API returned status {$status}." ], 500 );
+	}
+
+	$chat_data = json_decode( wp_remote_retrieve_body( $chat_response ), true );
+	$sources   = $chat_data['sources'] ?? [];
+
+	// Deduplicate by URL and return top 5.
+	$seen  = [];
+	$final = [];
+	foreach ( $sources as $source ) {
+		$url = $source['deep_link_url'] ?? $source['url'] ?? '';
+		$plain_url = $source['url'] ?? $url;
+		if ( empty( $plain_url ) || isset( $seen[ $plain_url ] ) ) {
+			continue;
+		}
+		$seen[ $plain_url ] = true;
+		$final[] = [
+			'title' => $source['title'] ?? $source['name'] ?? '',
+			'url'   => $url,
+			'text'  => mb_substr( $source['text'] ?? '', 0, 200 ),
+		];
+		if ( count( $final ) >= 5 ) {
+			break;
 		}
 	}
 

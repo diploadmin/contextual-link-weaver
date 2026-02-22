@@ -6,20 +6,29 @@ import { useState, useRef, useCallback } from '@wordpress/element';
 import { useSelect, useDispatch } from '@wordpress/data';
 import apiFetch from '@wordpress/api-fetch';
 import { registerFormatType, applyFormat } from '@wordpress/rich-text';
-import { RichTextToolbarButton } from '@wordpress/block-editor';
+import { BlockControls } from '@wordpress/block-editor';
+import { ToolbarGroup, ToolbarButton } from '@wordpress/components';
 
 // ─────────────────────────────────────────────────────────────────────────────
-// FORMAT TYPE — toolbar button that appears when text is selected
+// FORMAT TYPE — toolbar button: parallel LLM + RAG queries
 // ─────────────────────────────────────────────────────────────────────────────
 
 const FORMAT_TYPE = 'contextual-link-weaver/suggest';
 
-const LinkWeaverInlineButton = ( { value, onChange, isActive, contentRef } ) => {
-    const [ isOpen,     setIsOpen     ] = useState( false );
-    const [ isLoading,  setIsLoading  ] = useState( false );
-    const [ suggestions, setSuggestions ] = useState( [] );
-    const [ error,      setError      ] = useState( '' );
-    const [ anchorText, setAnchorText ] = useState( '' );
+const LinkWeaverInlineButton = ( { value, onChange, isActive } ) => {
+    const [ isOpen,       setIsOpen       ] = useState( false );
+    const [ anchorText,   setAnchorText   ] = useState( '' );
+
+    // LLM state
+    const [ llmLoading,   setLlmLoading   ] = useState( false );
+    const [ llmResults,   setLlmResults   ] = useState( [] );
+    const [ llmError,     setLlmError     ] = useState( '' );
+
+    // RAG state
+    const [ ragLoading,   setRagLoading   ] = useState( false );
+    const [ ragResults,   setRagResults   ] = useState( [] );
+    const [ ragError,     setRagError     ] = useState( '' );
+
     const buttonRef = useRef();
 
     const currentPostId = useSelect(
@@ -39,23 +48,33 @@ const LinkWeaverInlineButton = ( { value, onChange, isActive, contentRef } ) => 
 
         setAnchorText( selected );
         setIsOpen( true );
-        setIsLoading( true );
-        setSuggestions( [] );
-        setError( '' );
+        setLlmLoading( true );
+        setRagLoading( true );
+        setLlmResults( [] );
+        setRagResults( [] );
+        setLlmError( '' );
+        setRagError( '' );
 
+        // LLM call — internal posts
         apiFetch( {
             path: '/contextual-link-weaver/v1/link-for-text',
             method: 'POST',
             data: { anchor_text: selected, post_id: currentPostId },
         } )
-            .then( ( response ) => {
-                setSuggestions( Array.isArray( response ) ? response : [] );
-                setIsLoading( false );
-            } )
-            .catch( ( err ) => {
-                setError( err.message || __( 'An error occurred.', 'contextual-link-weaver' ) );
-                setIsLoading( false );
-            } );
+            .then( ( r ) => { setLlmResults( Array.isArray( r ) ? r : [] ); } )
+            .catch( ( e ) => { setLlmError( e.message || 'LLM error' ); } )
+            .finally( () => { setLlmLoading( false ); } );
+
+        // RAG call — external sources
+        apiFetch( {
+            path: '/contextual-link-weaver/v1/link-from-rag',
+            method: 'POST',
+            data: { query: selected },
+        } )
+            .then( ( r ) => { setRagResults( Array.isArray( r ) ? r : [] ); } )
+            .catch( ( e ) => { setRagError( e.message || 'RAG error' ); } )
+            .finally( () => { setRagLoading( false ); } );
+
     }, [ hasSelection, value, currentPostId ] );
 
     const handleInsert = useCallback( ( url ) => {
@@ -66,25 +85,32 @@ const LinkWeaverInlineButton = ( { value, onChange, isActive, contentRef } ) => 
             } )
         );
         setIsOpen( false );
-        setSuggestions( [] );
     }, [ value, onChange ] );
 
     const handleClose = useCallback( () => {
         setIsOpen( false );
-        setSuggestions( [] );
-        setError( '' );
+        setLlmResults( [] );
+        setRagResults( [] );
+        setLlmError( '' );
+        setRagError( '' );
     }, [] );
+
+    const isFullyDone = ! llmLoading && ! ragLoading;
 
     return (
         <>
-            <span ref={ buttonRef }>
-                <RichTextToolbarButton
-                    icon="admin-links"
-                    title={ __( 'Link Weaver — find link for selection', 'contextual-link-weaver' ) }
-                    onClick={ handleClick }
-                    isActive={ isActive }
-                />
-            </span>
+            <BlockControls group="other">
+                <ToolbarGroup>
+                    <span ref={ buttonRef }>
+                        <ToolbarButton
+                            icon="superhero"
+                            label={ __( 'Link Weaver — find link', 'contextual-link-weaver' ) }
+                            onClick={ handleClick }
+                            isActive={ isOpen }
+                        />
+                    </span>
+                </ToolbarGroup>
+            </BlockControls>
 
             { isOpen && (
                 <Popover
@@ -94,55 +120,76 @@ const LinkWeaverInlineButton = ( { value, onChange, isActive, contentRef } ) => 
                     focusOnMount={ false }
                 >
                     <div style={ styles.popover }>
+                        { /* ── Header ── */ }
                         <div style={ styles.popoverHeader }>
                             <strong style={ styles.popoverTitle }>
                                 { __( 'Links for:', 'contextual-link-weaver' ) }
                             </strong>
-                            <em style={ styles.popoverAnchor }>„{ anchorText }"</em>
-                            <button
-                                onClick={ handleClose }
-                                style={ styles.closeBtn }
-                                aria-label={ __( 'Close', 'contextual-link-weaver' ) }
-                            >✕</button>
+                            <em style={ styles.popoverAnchor }>&bdquo;{ anchorText }&ldquo;</em>
+                            <button onClick={ handleClose } style={ styles.closeBtn } aria-label="Close">✕</button>
                         </div>
 
-                        { isLoading && (
-                            <div style={ styles.loadingRow }>
-                                <Spinner />
-                                <span style={ styles.loadingText }>
-                                    { __( 'Searching for best links…', 'contextual-link-weaver' ) }
+                        { /* ── RAG Sources section ── */ }
+                        <div style={ styles.section }>
+                            <div style={ styles.sectionHeader }>
+                                <span style={ styles.sectionLabel }>
+                                    { __( 'Knowledge Base Sources', 'contextual-link-weaver' ) }
                                 </span>
+                                { ragLoading && <Spinner style={ { margin: 0 } } /> }
                             </div>
-                        ) }
 
-                        { error && (
-                            <p style={ styles.errorText }>{ error }</p>
-                        ) }
+                            { ragError && <p style={ styles.errorText }>{ ragError }</p> }
 
-                        { ! isLoading && ! error && suggestions.length === 0 && (
-                            <p style={ styles.emptyText }>
-                                { __( 'No matching posts found.', 'contextual-link-weaver' ) }
-                            </p>
-                        ) }
+                            { ! ragLoading && ! ragError && ragResults.length === 0 && (
+                                <p style={ styles.emptyText }>{ __( 'No sources found.', 'contextual-link-weaver' ) }</p>
+                            ) }
 
-                        { suggestions.map( ( s, i ) => (
-                            <div key={ i } style={ {
-                                ...styles.suggestionItem,
-                                borderTop: i > 0 ? '1px solid #f0f0f0' : 'none',
-                                paddingTop: i > 0 ? '12px' : '0',
-                                marginTop:  i > 0 ? '12px' : '0',
-                            } }>
-                                <p style={ styles.suggestionTitle }>{ s.title }</p>
-                                <p style={ styles.suggestionReason }>{ s.reasoning }</p>
-                                <Button
-                                    variant="primary"
-                                    __next40pxDefaultSize
-                                    onClick={ () => handleInsert( s.url ) }
-                                >
-                                    { __( 'Insert Link', 'contextual-link-weaver' ) }
-                                </Button>
+                            { ragResults.map( ( s, i ) => (
+                                <div key={ 'rag-' + i } style={ {
+                                    ...styles.suggestionItem,
+                                    borderTop: i > 0 ? '1px solid #f0f0f0' : 'none',
+                                    paddingTop: i > 0 ? '10px' : '0',
+                                    marginTop:  i > 0 ? '10px' : '0',
+                                } }>
+                                    <p style={ styles.suggestionTitle }>{ s.title }</p>
+                                    { s.text && <p style={ styles.suggestionReason }>{ s.text }</p> }
+                                    <Button variant="primary" isSmall onClick={ () => handleInsert( s.url ) }>
+                                        { __( 'Insert Link', 'contextual-link-weaver' ) }
+                                    </Button>
+                                </div>
+                            ) ) }
+                        </div>
+
+                        { /* ── LLM / Internal Posts section ── */ }
+                        <div style={ { ...styles.section, marginTop: '16px' } }>
+                            <div style={ styles.sectionHeader }>
+                                <span style={ styles.sectionLabel }>
+                                    { __( 'Internal Posts (LLM)', 'contextual-link-weaver' ) }
+                                </span>
+                                { llmLoading && <Spinner style={ { margin: 0 } } /> }
                             </div>
-                        ) ) }
+
+                            { llmError && <p style={ styles.errorText }>{ llmError }</p> }
+
+                            { ! llmLoading && ! llmError && llmResults.length === 0 && (
+                                <p style={ styles.emptyText }>{ __( 'No matching posts found.', 'contextual-link-weaver' ) }</p>
+                            ) }
+
+                            { llmResults.map( ( s, i ) => (
+                                <div key={ 'llm-' + i } style={ {
+                                    ...styles.suggestionItem,
+                                    borderTop: i > 0 ? '1px solid #f0f0f0' : 'none',
+                                    paddingTop: i > 0 ? '10px' : '0',
+                                    marginTop:  i > 0 ? '10px' : '0',
+                                } }>
+                                    <p style={ styles.suggestionTitle }>{ s.title }</p>
+                                    { s.reasoning && <p style={ styles.suggestionReason }>{ s.reasoning }</p> }
+                                    <Button variant="secondary" isSmall onClick={ () => handleInsert( s.url ) }>
+                                        { __( 'Insert Link', 'contextual-link-weaver' ) }
+                                    </Button>
+                                </div>
+                            ) ) }
+                        </div>
                     </div>
                 </Popover>
             ) }
@@ -152,8 +199,8 @@ const LinkWeaverInlineButton = ( { value, onChange, isActive, contentRef } ) => 
 
 registerFormatType( FORMAT_TYPE, {
     title:     __( 'Link Weaver Suggestion', 'contextual-link-weaver' ),
-    tagName:   'a',
-    className: null,
+    tagName:   'span',
+    className: 'clw-suggestion',
     edit:      LinkWeaverInlineButton,
 } );
 
@@ -191,11 +238,7 @@ const LinkWeaverSidebar = () => {
             data: { content: postContent, post_id: currentPostId },
         } )
             .then( ( response ) => {
-                if ( Array.isArray( response ) ) {
-                    setSuggestions( response );
-                } else {
-                    setError( __( 'The API returned an unexpected format.', 'contextual-link-weaver' ) );
-                }
+                setSuggestions( Array.isArray( response ) ? response : [] );
                 setIsLoading( false );
             } )
             .catch( ( err ) => {
@@ -237,7 +280,7 @@ const LinkWeaverSidebar = () => {
             const editorWrapper = document.querySelector( '.editor-styles-wrapper' );
 
             if ( editorWrapper ) {
-                const observer = new MutationObserver( ( mutationsList, obs ) => {
+                const observer = new MutationObserver( ( _, obs ) => {
                     const targetBlock = document.querySelector( `[data-block="${ targetBlockClientId }"]` );
                     if ( targetBlock ) {
                         targetBlock.scrollIntoView( { behavior: 'smooth', block: 'center' } );
@@ -255,7 +298,7 @@ const LinkWeaverSidebar = () => {
             replaceBlocks( blocks.map( ( b ) => b.clientId ), newBlocks );
             setSuggestions( suggestions.filter( ( s ) => s.anchor_text !== anchorText ) );
         } else {
-            alert( `Could not find the exact phrase "${ anchorText }" in your content. It might be split across multiple paragraphs.` );
+            alert( `Could not find the exact phrase "${ anchorText }" in your content.` );
         }
     };
 
@@ -268,10 +311,7 @@ const LinkWeaverSidebar = () => {
             <PluginSidebar name="link-weaver-sidebar" title={ __( 'Link Weaver', 'contextual-link-weaver' ) }>
                 <PanelBody title={ __( 'Link Suggestions', 'contextual-link-weaver' ) }>
                     <p style={ { fontSize: '12px', color: '#666', marginBottom: '12px' } }>
-                        { __( 'Scan the entire post and get up to 5 internal link suggestions.', 'contextual-link-weaver' ) }
-                    </p>
-                    <p style={ { fontSize: '12px', color: '#666', marginBottom: '12px' } }>
-                        { __( 'Tip: select any phrase in the editor and click the 🔗 toolbar button to find a link just for that text.', 'contextual-link-weaver' ) }
+                        { __( 'Scan the entire post for up to 5 internal link suggestions, or select text and use the toolbar button for targeted search.', 'contextual-link-weaver' ) }
                     </p>
                     <Button
                         variant="primary"
@@ -298,7 +338,7 @@ const LinkWeaverSidebar = () => {
                                     <li key={ index } style={ styles.sidebarItem }>
                                         <p style={ { margin: '0 0 6px 0', fontSize: '13px' } }>
                                             <strong>{ __( 'Phrase:', 'contextual-link-weaver' ) }</strong><br />
-                                            <em>„{ item.anchor_text }"</em>
+                                            <em>&bdquo;{ item.anchor_text }&ldquo;</em>
                                         </p>
                                         <p style={ { margin: '0 0 10px 0', fontSize: '12px', color: '#555' } }>
                                             <strong>{ __( 'Link to:', 'contextual-link-weaver' ) }</strong><br />
@@ -331,8 +371,10 @@ registerPlugin( 'link-weaver-plugin', { render: LinkWeaverSidebar } );
 const styles = {
     popover: {
         padding: '16px',
-        minWidth: '300px',
-        maxWidth: '380px',
+        minWidth: '320px',
+        maxWidth: '420px',
+        maxHeight: '70vh',
+        overflowY: 'auto',
         fontSize: '13px',
     },
     popoverHeader: {
@@ -340,7 +382,7 @@ const styles = {
         flexWrap: 'wrap',
         alignItems: 'baseline',
         gap: '6px',
-        marginBottom: '12px',
+        marginBottom: '14px',
         paddingBottom: '10px',
         borderBottom: '1px solid #e0e0e0',
         position: 'relative',
@@ -368,40 +410,49 @@ const styles = {
         padding: '0',
         lineHeight: 1,
     },
-    loadingRow: {
+    section: {
+        padding: '12px',
+        background: '#f9f9f9',
+        borderRadius: '6px',
+        border: '1px solid #eaeaea',
+    },
+    sectionHeader: {
         display: 'flex',
         alignItems: 'center',
-        gap: '10px',
-        padding: '8px 0',
+        gap: '8px',
+        marginBottom: '10px',
     },
-    loadingText: {
-        fontSize: '12px',
-        color: '#666',
+    sectionLabel: {
+        fontSize: '11px',
+        fontWeight: '600',
+        textTransform: 'uppercase',
+        letterSpacing: '0.5px',
+        color: '#555',
     },
     errorText: {
         color: '#cc1818',
         fontSize: '12px',
-        margin: '8px 0',
+        margin: '4px 0',
     },
     emptyText: {
         color: '#888',
         fontSize: '12px',
-        margin: '8px 0',
+        margin: '4px 0',
     },
     suggestionItem: {
         paddingBottom: '4px',
     },
     suggestionTitle: {
-        margin: '0 0 4px 0',
+        margin: '0 0 3px 0',
         fontWeight: '600',
         fontSize: '13px',
         color: '#1e1e1e',
     },
     suggestionReason: {
-        margin: '0 0 10px 0',
+        margin: '0 0 8px 0',
         fontSize: '11px',
         color: '#888',
-        lineHeight: '1.5',
+        lineHeight: '1.4',
     },
     sidebarItem: {
         border: '1px solid #ddd',
