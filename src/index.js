@@ -1,3 +1,29 @@
+/**
+ * Contextual Link Weaver — Gutenberg Editor Integration
+ *
+ * This file registers two Gutenberg extensions:
+ *
+ * 1. FORMAT TYPE (toolbar button)
+ *    - Registered via registerFormatType as 'contextual-link-weaver/suggest'
+ *    - Adds a "superhero" icon to the block toolbar when editing rich text
+ *    - On click: reads the selected text, fires TWO parallel API calls:
+ *        a) /link-for-text → LLM ranks internal posts by relevance
+ *        b) /link-from-rag → Chatbot API returns knowledge base sources
+ *    - Results appear in a Popover with two sections, each with "Insert Link"
+ *    - Insert applies core/link format to the selection via applyFormat()
+ *
+ * 2. PLUGIN SIDEBAR
+ *    - Registered via registerPlugin as 'link-weaver-plugin'
+ *    - Full post scan: sends entire post content to /suggestions endpoint
+ *    - LLM identifies verbatim phrases + suggests internal posts for each
+ *    - One-click insertion replaces the phrase in-place with an <a> tag,
+ *      scrolls to the link, and highlights it briefly
+ *
+ * All API calls go through WordPress apiFetch (handles nonce auth automatically).
+ *
+ * @package ContextualLinkWeaver
+ */
+
 import { registerPlugin } from '@wordpress/plugins';
 import { PluginSidebar, PluginSidebarMoreMenuItem } from '@wordpress/edit-post';
 import { PanelBody, Button, Spinner, Popover } from '@wordpress/components';
@@ -10,25 +36,39 @@ import { BlockControls } from '@wordpress/block-editor';
 import { ToolbarGroup, ToolbarButton } from '@wordpress/components';
 
 // ─────────────────────────────────────────────────────────────────────────────
-// FORMAT TYPE — toolbar button: parallel LLM + RAG queries
+// FORMAT TYPE — Toolbar button with parallel LLM + RAG queries
 // ─────────────────────────────────────────────────────────────────────────────
+//
+// Registered as a format type so it integrates with the Gutenberg rich-text
+// system. We use tagName: 'span' with a custom className to avoid conflicts
+// with core/link which owns the <a> tag. The edit component receives the
+// current rich-text `value` (with selection offsets) and an `onChange` callback.
 
 const FORMAT_TYPE = 'contextual-link-weaver/suggest';
 
+/**
+ * The edit component for the format type. Renders:
+ *   - A ToolbarButton in the block toolbar (via BlockControls)
+ *   - A Popover (when open) showing RAG + LLM results
+ *
+ * @param {Object}   props          Props from registerFormatType
+ * @param {Object}   props.value    Rich-text value with .text, .start, .end
+ * @param {Function} props.onChange Callback to update the rich-text value
+ * @param {boolean}  props.isActive Whether this format is currently active
+ */
 const LinkWeaverInlineButton = ( { value, onChange, isActive } ) => {
     const [ isOpen,       setIsOpen       ] = useState( false );
     const [ anchorText,   setAnchorText   ] = useState( '' );
 
-    // LLM state
     const [ llmLoading,   setLlmLoading   ] = useState( false );
     const [ llmResults,   setLlmResults   ] = useState( [] );
     const [ llmError,     setLlmError     ] = useState( '' );
 
-    // RAG state
     const [ ragLoading,   setRagLoading   ] = useState( false );
     const [ ragResults,   setRagResults   ] = useState( [] );
     const [ ragError,     setRagError     ] = useState( '' );
 
+    // Ref for the toolbar button — used as the Popover anchor.
     const buttonRef = useRef();
 
     const currentPostId = useSelect(
@@ -36,10 +76,16 @@ const LinkWeaverInlineButton = ( { value, onChange, isActive } ) => {
         []
     );
 
+    // Check if user has an active text selection (start !== end).
     const hasSelection = value.start !== undefined &&
                          value.end   !== undefined &&
                          value.start !== value.end;
 
+    /**
+     * Extracts the selected text and fires both API calls in parallel.
+     * Results stream in independently — RAG typically responds faster (~12s)
+     * while LLM may take 5-15s depending on the number of posts.
+     */
     const handleClick = useCallback( () => {
         if ( ! hasSelection ) return;
 
@@ -55,7 +101,6 @@ const LinkWeaverInlineButton = ( { value, onChange, isActive } ) => {
         setLlmError( '' );
         setRagError( '' );
 
-        // LLM call — internal posts
         apiFetch( {
             path: '/contextual-link-weaver/v1/link-for-text',
             method: 'POST',
@@ -65,7 +110,6 @@ const LinkWeaverInlineButton = ( { value, onChange, isActive } ) => {
             .catch( ( e ) => { setLlmError( e.message || 'LLM error' ); } )
             .finally( () => { setLlmLoading( false ); } );
 
-        // RAG call — external sources
         apiFetch( {
             path: '/contextual-link-weaver/v1/link-from-rag',
             method: 'POST',
@@ -77,6 +121,11 @@ const LinkWeaverInlineButton = ( { value, onChange, isActive } ) => {
 
     }, [ hasSelection, value, currentPostId ] );
 
+    /**
+     * Wraps the current selection in a core/link format with the given URL.
+     * This is the standard WordPress way to insert links in rich text —
+     * equivalent to clicking the built-in link button and typing a URL.
+     */
     const handleInsert = useCallback( ( url ) => {
         onChange(
             applyFormat( value, {
@@ -95,10 +144,9 @@ const LinkWeaverInlineButton = ( { value, onChange, isActive } ) => {
         setRagError( '' );
     }, [] );
 
-    const isFullyDone = ! llmLoading && ! ragLoading;
-
     return (
         <>
+            { /* Toolbar button — placed in the "other" group (after alignment etc.) */ }
             <BlockControls group="other">
                 <ToolbarGroup>
                     <span ref={ buttonRef }>
@@ -120,7 +168,6 @@ const LinkWeaverInlineButton = ( { value, onChange, isActive } ) => {
                     focusOnMount={ false }
                 >
                     <div style={ styles.popover }>
-                        { /* ── Header ── */ }
                         <div style={ styles.popoverHeader }>
                             <strong style={ styles.popoverTitle }>
                                 { __( 'Links for:', 'contextual-link-weaver' ) }
@@ -129,7 +176,7 @@ const LinkWeaverInlineButton = ( { value, onChange, isActive } ) => {
                             <button onClick={ handleClose } style={ styles.closeBtn } aria-label="Close">✕</button>
                         </div>
 
-                        { /* ── RAG Sources section ── */ }
+                        { /* RAG section — knowledge base sources from chatbot API */ }
                         <div style={ styles.section }>
                             <div style={ styles.sectionHeader }>
                                 <span style={ styles.sectionLabel }>
@@ -160,7 +207,7 @@ const LinkWeaverInlineButton = ( { value, onChange, isActive } ) => {
                             ) ) }
                         </div>
 
-                        { /* ── LLM / Internal Posts section ── */ }
+                        { /* LLM section — internal posts ranked by the LLM */ }
                         <div style={ { ...styles.section, marginTop: '16px' } }>
                             <div style={ styles.sectionHeader }>
                                 <span style={ styles.sectionLabel }>
@@ -205,8 +252,17 @@ registerFormatType( FORMAT_TYPE, {
 } );
 
 // ─────────────────────────────────────────────────────────────────────────────
-// SIDEBAR — full post scan (existing functionality)
+// SIDEBAR — Full post scan via LLM
 // ─────────────────────────────────────────────────────────────────────────────
+//
+// Registered as a Gutenberg plugin sidebar. When the user clicks "Scan Post &
+// Generate", it sends the entire post HTML content to /suggestions. The LLM
+// finds verbatim phrases and suggests which internal post each should link to.
+//
+// handleInsertLink() does in-place replacement: it walks all blocks, finds the
+// one containing the anchor text, wraps it in an <a> tag, then uses
+// replaceBlocks() to update the editor state. A MutationObserver watches for
+// the DOM update and scrolls/highlights the inserted link.
 
 const LinkWeaverIcon = () => <span className="dashicons dashicons-admin-links"></span>;
 
@@ -247,6 +303,20 @@ const LinkWeaverSidebar = () => {
             } );
     };
 
+    /**
+     * Inserts a link by directly manipulating block content HTML.
+     *
+     * Strategy:
+     *   1. Iterate all blocks, find the first whose content contains anchorText
+     *   2. Replace the plain text with an <a> tag (class="clw-inserted-link")
+     *   3. Use replaceBlocks() to commit the change to the editor store
+     *   4. Set up a MutationObserver to detect when the DOM updates, then
+     *      scroll to the block and briefly highlight the new link
+     *   5. Remove the accepted suggestion from the sidebar list
+     *
+     * The temporary CSS class "clw-inserted-link" is used to locate the link
+     * in the DOM after render, then swapped to "clw-highlight-link" for styling.
+     */
     const handleInsertLink = ( anchorText, url ) => {
         let linkInserted = false;
         let targetBlockClientId = null;
@@ -365,8 +435,10 @@ const LinkWeaverSidebar = () => {
 registerPlugin( 'link-weaver-plugin', { render: LinkWeaverSidebar } );
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Shared styles
+// Shared inline styles
 // ─────────────────────────────────────────────────────────────────────────────
+// Using inline styles because the plugin doesn't ship a CSS file.
+// The Popover and sidebar share some visual patterns (suggestion cards, etc.).
 
 const styles = {
     popover: {

@@ -9,21 +9,49 @@
  * License:           GPL v2 or later
  * License URI:       https://www.gnu.org/licenses/gpl-2.0.html
  * Text Domain:       contextual-link-weaver
+ *
+ * This plugin adds two link discovery mechanisms to the Gutenberg editor:
+ *
+ * 1. SIDEBAR (full post scan) — Sends the entire post content + a JSON list of
+ *    all published posts to the configured LLM. The LLM identifies verbatim
+ *    phrases in the text and suggests internal posts to link each phrase to.
+ *
+ * 2. TOOLBAR BUTTON (selection-based) — When the user selects text and clicks
+ *    the toolbar button, two queries fire in parallel:
+ *      a) LLM query: finds matching internal posts for the selected phrase
+ *      b) RAG query: sends the phrase to an external chatbot API (Weaviate-
+ *         backed retrieval + reranking) and returns knowledge base sources
+ *
+ * All settings (LLM provider, API keys, RAG URL) are managed via the WordPress
+ * admin under Settings > Link Weaver.
+ *
+ * @package ContextualLinkWeaver
  */
 
 if ( ! defined( 'ABSPATH' ) ) {
 	exit;
 }
 
-// Include the file that handles LLM API communication.
 require_once plugin_dir_path( __FILE__ ) . 'includes/gemini-api.php';
 
 /*
 ||--------------------------------------------------------------------------
 || Admin Settings Page
 ||--------------------------------------------------------------------------
+||
+|| Registers a settings page under Settings > Link Weaver with three sections:
+||   1. LLM Provider — dropdown to switch between Gemini and local LLM
+||   2. Provider-specific fields — API key (Gemini) or URL/model/key (local)
+||   3. RAG / Chatbot API — optional URL for knowledge base source discovery
+||
+|| Provider sections show/hide dynamically via inline JS (no page reload).
+|| All options are stored in the wp_options table with the 'clw_' prefix.
+||
 */
 
+/**
+ * Registers the settings page as a submenu under the WordPress Settings menu.
+ */
 function clw_add_admin_menu() {
 	add_options_page(
 		'Contextual Link Weaver Settings',
@@ -35,27 +63,34 @@ function clw_add_admin_menu() {
 }
 add_action( 'admin_menu', 'clw_add_admin_menu' );
 
+/**
+ * Registers all plugin settings with the WordPress Settings API.
+ *
+ * Options registered:
+ *   clw_llm_provider    — 'gemini' or 'local' (determines which LLM backend to use)
+ *   clw_gemini_api_key  — Google AI Studio API key
+ *   clw_rag_api_url     — Base URL of the chatbot API for RAG source discovery
+ *   clw_llm_url         — Base URL for OpenAI-compatible endpoint (includes /v1)
+ *   clw_llm_model       — Model identifier (e.g. 'openai/gpt-oss-20b')
+ *   clw_llm_key         — Bearer token for the OpenAI-compatible endpoint
+ */
 function clw_settings_init() {
-	// Provider selector
 	register_setting( 'clw_settings_group', 'clw_llm_provider', [
 		'sanitize_callback' => 'sanitize_text_field',
 		'type'              => 'string',
 		'default'           => 'gemini',
 	] );
 
-	// Gemini settings
 	register_setting( 'clw_settings_group', 'clw_gemini_api_key', [
 		'sanitize_callback' => 'sanitize_text_field',
 		'type'              => 'string',
 	] );
 
-	// RAG / Chatbot API settings
 	register_setting( 'clw_settings_group', 'clw_rag_api_url', [
 		'sanitize_callback' => 'sanitize_text_field',
 		'type'              => 'string',
 	] );
 
-	// Local LLM settings
 	register_setting( 'clw_settings_group', 'clw_llm_url', [
 		'sanitize_callback' => 'sanitize_text_field',
 		'type'              => 'string',
@@ -83,6 +118,20 @@ function clw_settings_init() {
 }
 add_action( 'admin_init', 'clw_settings_init' );
 
+/*
+||--------------------------------------------------------------------------
+|| Settings Field Callbacks
+||--------------------------------------------------------------------------
+||
+|| Each function renders one form field. The provider dropdown includes
+|| inline JavaScript that toggles visibility of the Gemini/Local sections
+|| without a page reload — using getElementById on wrapper divs.
+||
+*/
+
+/**
+ * Renders the LLM provider dropdown and the JS that toggles settings sections.
+ */
 function clw_provider_field_callback() {
 	$value = get_option( 'clw_llm_provider', 'gemini' );
 	?>
@@ -144,6 +193,13 @@ function clw_rag_url_field_callback() {
 	);
 }
 
+/**
+ * Renders the full settings page HTML.
+ *
+ * Uses a custom layout instead of do_settings_sections() so that the Gemini
+ * and Local sections can be wrapped in <div> elements with IDs for JS toggling.
+ * The RAG section is always visible since it's provider-independent.
+ */
 function clw_settings_page_html() {
 	if ( ! current_user_can( 'manage_options' ) ) {
 		return;
@@ -211,8 +267,25 @@ function clw_settings_page_html() {
 ||--------------------------------------------------------------------------
 || Gutenberg Editor Integration
 ||--------------------------------------------------------------------------
+||
+|| Loads the compiled React JS (build/index.js) into the Gutenberg editor.
+|| The JS registers:
+||   - A format type with a toolbar button for selection-based link discovery
+||   - A plugin sidebar for full post scanning
+||
+|| Three REST API endpoints are registered for the JS to call:
+||   POST /suggestions   — full post scan (LLM)
+||   POST /link-for-text — selection-based internal post matching (LLM)
+||   POST /link-from-rag — selection-based source discovery (external RAG API)
+||
 */
 
+/**
+ * Enqueues the compiled editor JS only inside the block editor.
+ *
+ * Uses the auto-generated build/index.asset.php manifest to declare
+ * the correct WordPress script dependencies and version hash.
+ */
 function clw_enqueue_editor_assets() {
 	$asset_file_path = plugin_dir_path( __FILE__ ) . 'build/index.asset.php';
 
@@ -231,24 +304,28 @@ function clw_enqueue_editor_assets() {
 }
 add_action( 'enqueue_block_editor_assets', 'clw_enqueue_editor_assets' );
 
+/**
+ * Registers all custom REST API routes.
+ *
+ * All routes require the edit_posts capability — only logged-in
+ * editors and admins can access them. The routes are namespaced
+ * under 'contextual-link-weaver/v1'.
+ */
 function clw_register_rest_route() {
 	$permission = function () { return current_user_can( 'edit_posts' ); };
 
-	// Full post scan — returns up to 5 anchor+link suggestions.
 	register_rest_route( 'contextual-link-weaver/v1', '/suggestions', [
 		'methods'             => 'POST',
 		'callback'            => 'clw_handle_suggestions_request',
 		'permission_callback' => $permission,
 	] );
 
-	// Selection-based — given a highlighted phrase, returns best matching posts.
 	register_rest_route( 'contextual-link-weaver/v1', '/link-for-text', [
 		'methods'             => 'POST',
 		'callback'            => 'clw_handle_link_for_text_request',
 		'permission_callback' => $permission,
 	] );
 
-	// RAG-based — queries chatbot API for relevant sources.
 	register_rest_route( 'contextual-link-weaver/v1', '/link-from-rag', [
 		'methods'             => 'POST',
 		'callback'            => 'clw_handle_link_from_rag_request',
@@ -257,8 +334,29 @@ function clw_register_rest_route() {
 }
 add_action( 'rest_api_init', 'clw_register_rest_route' );
 
+/*
+||--------------------------------------------------------------------------
+|| REST Handler: Full Post Scan (/suggestions)
+||--------------------------------------------------------------------------
+||
+|| Called from the sidebar "Scan Post & Generate" button.
+||
+|| Flow:
+||   1. Receive post content + post_id from the editor
+||   2. Load ALL published posts (excluding current) as {id, title, url}
+||   3. Build an LLM prompt that includes the full post content and post list
+||   4. LLM returns up to 5 suggestions: verbatim anchor_text + post_id_to_link
+||   5. Enrich each suggestion with title/url by cross-referencing the post list
+||   6. Return the enriched array to the JS sidebar
+||
+|| The prompt enforces strict rules: anchor text must exist verbatim in the
+|| draft, must be 4-6 words, and must not be an article title.
+||
+*/
+
 /**
- * Handles the incoming request from the editor to generate link suggestions.
+ * @param  WP_REST_Request  $request  Must contain 'content' and 'post_id'.
+ * @return WP_REST_Response           Array of {anchor_text, post_id_to_link, reasoning, title, url}.
  */
 function clw_handle_suggestions_request( WP_REST_Request $request ) {
 	$post_content = $request->get_param( 'content' );
@@ -321,7 +419,6 @@ function clw_handle_suggestions_request( WP_REST_Request $request ) {
 		return new WP_REST_Response( [ 'error' => 'API returned a non-array response.' ], 500 );
 	}
 
-	// Unwrap {"suggestions": [...]} envelope if present.
 	if ( isset( $suggestions_from_api['suggestions'] ) && is_array( $suggestions_from_api['suggestions'] ) ) {
 		$suggestions_from_api = $suggestions_from_api['suggestions'];
 	}
@@ -341,9 +438,22 @@ function clw_handle_suggestions_request( WP_REST_Request $request ) {
 	return new WP_REST_Response( $final_suggestions, 200 );
 }
 
+/*
+||--------------------------------------------------------------------------
+|| REST Handler: Selection-Based LLM (/link-for-text)
+||--------------------------------------------------------------------------
+||
+|| Called when the user selects text and clicks the toolbar button.
+|| Unlike /suggestions, the anchor text is already known (user selected it),
+|| so the LLM only needs to rank which posts are most relevant for linking.
+||
+|| The post list is keyed by ID for O(1) lookup when enriching results.
+||
+*/
+
 /**
- * Handles a selection-based request: given a highlighted phrase, returns the
- * best matching posts to link to (no anchor text discovery needed).
+ * @param  WP_REST_Request  $request  Must contain 'anchor_text', optionally 'post_id'.
+ * @return WP_REST_Response           Array of {post_id, title, url, reasoning}.
  */
 function clw_handle_link_for_text_request( WP_REST_Request $request ) {
 	$anchor_text     = trim( $request->get_param( 'anchor_text' ) );
@@ -417,8 +527,30 @@ function clw_handle_link_for_text_request( WP_REST_Request $request ) {
 	return new WP_REST_Response( $final, 200 );
 }
 
+/*
+||--------------------------------------------------------------------------
+|| REST Handler: RAG Source Discovery (/link-from-rag)
+||--------------------------------------------------------------------------
+||
+|| Queries an external chatbot API that uses Weaviate vector search + reranking
+|| to find the most relevant knowledge base pages for a given text query.
+||
+|| Two-step process:
+||   1. POST /api/conversation/get_id → obtains a fresh conversation_id
+||   2. POST /api/chat/{conversation_id} → sends the query, gets sources
+||
+|| The chatbot API returns sources with deep_link_url fields that include
+|| highlight parameters (?diplo-hl-id=...) so the user lands directly on
+|| the relevant passage when clicking the link.
+||
+|| Results are deduplicated by base URL (same page may appear multiple times
+|| with different highlighted passages) and capped at 5.
+||
+*/
+
 /**
- * Queries the external chatbot RAG API for relevant sources given a text phrase.
+ * @param  WP_REST_Request  $request  Must contain 'query' (the selected text).
+ * @return WP_REST_Response           Array of {title, url, text} (max 5).
  */
 function clw_handle_link_from_rag_request( WP_REST_Request $request ) {
 	$query = trim( $request->get_param( 'query' ) );
@@ -431,7 +563,6 @@ function clw_handle_link_from_rag_request( WP_REST_Request $request ) {
 		return new WP_REST_Response( [ 'error' => 'RAG Chatbot API URL is not configured.' ], 500 );
 	}
 
-	// Step 1: Get a fresh conversation ID.
 	$conv_response = wp_remote_post( $base_url . '/api/conversation/get_id', [
 		'headers' => [ 'Content-Type' => 'application/json' ],
 		'body'    => '{"conversation_id": null}',
@@ -449,7 +580,6 @@ function clw_handle_link_from_rag_request( WP_REST_Request $request ) {
 		return new WP_REST_Response( [ 'error' => 'Could not obtain conversation ID from chatbot API.' ], 500 );
 	}
 
-	// Step 2: Send the query and get sources.
 	$chat_response = wp_remote_post( $base_url . '/api/chat/' . $conversation_id, [
 		'headers' => [ 'Content-Type' => 'application/json' ],
 		'body'    => wp_json_encode( [
@@ -472,11 +602,10 @@ function clw_handle_link_from_rag_request( WP_REST_Request $request ) {
 	$chat_data = json_decode( wp_remote_retrieve_body( $chat_response ), true );
 	$sources   = $chat_data['sources'] ?? [];
 
-	// Deduplicate by URL and return top 5.
 	$seen  = [];
 	$final = [];
 	foreach ( $sources as $source ) {
-		$url = $source['deep_link_url'] ?? $source['url'] ?? '';
+		$url       = $source['deep_link_url'] ?? $source['url'] ?? '';
 		$plain_url = $source['url'] ?? $url;
 		if ( empty( $plain_url ) || isset( $seen[ $plain_url ] ) ) {
 			continue;
