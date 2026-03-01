@@ -26,7 +26,7 @@
 
 import { registerPlugin } from '@wordpress/plugins';
 import { PluginSidebar, PluginSidebarMoreMenuItem } from '@wordpress/edit-post';
-import { PanelBody, Button, Spinner, Popover } from '@wordpress/components';
+import { PanelBody, Button, Spinner, Popover, SelectControl } from '@wordpress/components';
 import { __ } from '@wordpress/i18n';
 import { useState, useRef, useCallback } from '@wordpress/element';
 import { useSelect, useDispatch } from '@wordpress/data';
@@ -107,7 +107,7 @@ const LinkWeaverInlineButton = ( { value, onChange, isActive } ) => {
             data: { anchor_text: selected, post_id: currentPostId },
         } )
             .then( ( r ) => { setLlmResults( Array.isArray( r ) ? r : [] ); } )
-            .catch( ( e ) => { setLlmError( e.message || 'LLM error' ); } )
+            .catch( ( e ) => { setLlmError( e.message || e.error || 'LLM error' ); } )
             .finally( () => { setLlmLoading( false ); } );
 
         apiFetch( {
@@ -116,7 +116,7 @@ const LinkWeaverInlineButton = ( { value, onChange, isActive } ) => {
             data: { query: selected },
         } )
             .then( ( r ) => { setRagResults( Array.isArray( r ) ? r : [] ); } )
-            .catch( ( e ) => { setRagError( e.message || 'RAG error' ); } )
+            .catch( ( e ) => { setRagError( e.message || e.error || 'RAG error' ); } )
             .finally( () => { setRagLoading( false ); } );
 
     }, [ hasSelection, value, currentPostId ] );
@@ -270,6 +270,7 @@ const LinkWeaverSidebar = () => {
     const [ isLoading,   setIsLoading   ] = useState( false );
     const [ suggestions, setSuggestions ] = useState( [] );
     const [ error,       setError       ] = useState( '' );
+    const [ mode,        setMode        ] = useState( 'rag' );
 
     const { postContent, currentPostId, blocks } = useSelect( ( select ) => ( {
         postContent:   select( 'core/editor' ).getEditedPostContent(),
@@ -291,14 +292,14 @@ const LinkWeaverSidebar = () => {
         apiFetch( {
             path: '/contextual-link-weaver/v1/suggestions',
             method: 'POST',
-            data: { content: postContent, post_id: currentPostId },
+            data: { content: postContent, post_id: currentPostId, mode },
         } )
             .then( ( response ) => {
                 setSuggestions( Array.isArray( response ) ? response : [] );
                 setIsLoading( false );
             } )
             .catch( ( err ) => {
-                setError( err.message || __( 'An unknown error occurred.', 'contextual-link-weaver' ) );
+                setError( err.message || err.error || __( 'An unknown error occurred.', 'contextual-link-weaver' ) );
                 setIsLoading( false );
             } );
     };
@@ -383,6 +384,16 @@ const LinkWeaverSidebar = () => {
                     <p style={ { fontSize: '12px', color: '#666', marginBottom: '12px' } }>
                         { __( 'Scan the entire post for up to 5 internal link suggestions, or select text and use the toolbar button for targeted search.', 'contextual-link-weaver' ) }
                     </p>
+                    <SelectControl
+                        label={ __( 'Scan Mode', 'contextual-link-weaver' ) }
+                        value={ mode }
+                        options={ [
+                            { label: 'LLM + Knowledge Base (RAG)', value: 'rag' },
+                            { label: 'LLM Only (Internal Posts)', value: 'llm' },
+                        ] }
+                        onChange={ setMode }
+                        __nextHasNoMarginBottom
+                    />
                     <Button
                         variant="primary"
                         __next40pxDefaultSize
@@ -410,14 +421,19 @@ const LinkWeaverSidebar = () => {
                                             <strong>{ __( 'Phrase:', 'contextual-link-weaver' ) }</strong><br />
                                             <em>&bdquo;{ item.anchor_text }&ldquo;</em>
                                         </p>
-                                        <p style={ { margin: '0 0 10px 0', fontSize: '12px', color: '#555' } }>
+                                        <p style={ { margin: '0 0 4px 0', fontSize: '12px', color: '#555' } }>
                                             <strong>{ __( 'Link to:', 'contextual-link-weaver' ) }</strong><br />
                                             { item.title }
                                         </p>
+                                        { item.text && (
+                                            <p style={ { margin: '0 0 10px 0', fontSize: '11px', color: '#888', lineHeight: '1.4' } }>
+                                                { item.text }
+                                            </p>
+                                        ) }
                                         <Button
                                             variant="secondary"
                                             __next40pxDefaultSize
-                                            onClick={ () => handleInsertLink( item.anchor_text, item.url ) }
+                                            onClick={ () => handleInsertLink( item.anchor_text, item.deep_link_url || item.url ) }
                                         >
                                             { __( 'Insert Link', 'contextual-link-weaver' ) }
                                         </Button>

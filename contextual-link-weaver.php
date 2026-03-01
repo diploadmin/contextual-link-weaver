@@ -12,9 +12,10 @@
  *
  * This plugin adds two link discovery mechanisms to the Gutenberg editor:
  *
- * 1. SIDEBAR (full post scan) — Sends the entire post content + a JSON list of
- *    all published posts to the configured LLM. The LLM identifies verbatim
- *    phrases in the text and suggests internal posts to link each phrase to.
+ * 1. SIDEBAR (full post scan) — Sends the entire post content to the LLM which
+ *    identifies up to 5 verbatim phrases suitable for linking. Each phrase is
+ *    then sent through the RAG pipeline (chatbot API) in parallel to find the
+ *    most relevant knowledge base source via reranker scoring.
  *
  * 2. TOOLBAR BUTTON (selection-based) — When the user selects text and clicks
  *    the toolbar button, two queries fire in parallel:
@@ -115,6 +116,8 @@ function clw_settings_init() {
 	add_settings_field( 'clw_llm_model_field',       'Model Name',      'clw_llm_model_field_callback',   'contextual-link-weaver', 'clw_local_section' );
 	add_settings_field( 'clw_llm_key_field',         'API Key',         'clw_llm_key_field_callback',     'contextual-link-weaver', 'clw_local_section' );
 	add_settings_field( 'clw_rag_api_url_field',     'Chatbot API URL', 'clw_rag_url_field_callback',     'contextual-link-weaver', 'clw_rag_section' );
+
+	clw_register_retrieval_settings();
 }
 add_action( 'admin_init', 'clw_settings_init' );
 
@@ -193,6 +196,153 @@ function clw_rag_url_field_callback() {
 	);
 }
 
+/*
+||--------------------------------------------------------------------------
+|| Retrieval Settings (RAG Pipeline Parameters)
+||--------------------------------------------------------------------------
+||
+|| Mirrors the chatbot plugin's retrieval configuration. These parameters
+|| are sent as retrieval_config in every RAG API call, allowing per-site
+|| tuning of the retrieval pipeline without touching the backend .env.
+||
+*/
+
+$clw_retrieval_options = array(
+	'retrieval_mode' => array( 'label' => 'Retrieval Mode', 'type' => 'select', 'default' => 'sentence',
+		'options' => array( 'sentence' => 'Sentence', 'paragraph' => 'Paragraph', 'combined' => 'Combined', 'twophase' => 'Two-Phase' ),
+		'description' => 'Strategy for searching documents. Sentence = search sentences then aggregate to sections.', 'section' => 'basic' ),
+	'retrieval_chunks' => array( 'label' => 'Retrieval Chunks', 'type' => 'number', 'default' => 8,
+		'description' => 'Number of document chunks sent to LLM as context.', 'section' => 'basic' ),
+	'hybrid_alpha' => array( 'label' => 'Hybrid Alpha', 'type' => 'number', 'default' => 0.75, 'step' => '0.01',
+		'description' => 'Balance vector vs BM25 search. 1.0 = pure vector, 0.0 = pure keyword.', 'section' => 'basic' ),
+	'sentence_retrieval_k' => array( 'label' => 'Sentence Retrieval K', 'type' => 'number', 'default' => 200,
+		'description' => 'Sentences fetched from Weaviate before aggregation.', 'section' => 'basic' ),
+
+	'use_reranker' => array( 'label' => 'Use Reranker', 'type' => 'toggle', 'default' => true,
+		'description' => 'Enable TEI cross-encoder reranking for better result quality.', 'section' => 'reranker' ),
+	'reranker_top_k' => array( 'label' => 'Reranker Top K', 'type' => 'number', 'default' => 25,
+		'description' => 'How many documents the reranker returns.', 'section' => 'reranker' ),
+	'sentence_reranker_top_k' => array( 'label' => 'Sentence Reranker Top K', 'type' => 'number', 'default' => 50,
+		'description' => 'Override for sentence/combined mode reranker candidates.', 'section' => 'reranker' ),
+	'sentence_ce_candidates' => array( 'label' => 'CE Candidates per Section', 'type' => 'number', 'default' => 3,
+		'description' => 'Candidates per section group sent to cross-encoder.', 'section' => 'reranker' ),
+	'sentence_ce_max_groups' => array( 'label' => 'CE Max Groups', 'type' => 'number', 'default' => 20,
+		'description' => 'Maximum groups sent through sentence-level cross-encoder.', 'section' => 'reranker' ),
+
+	'heading_boost_weight' => array( 'label' => 'Heading Boost Weight', 'type' => 'number', 'default' => 0.5, 'step' => '0.1',
+		'description' => 'Weight for heading similarity boost. 0 = disabled.', 'section' => 'heading' ),
+	'heading_inject_min_sim' => array( 'label' => 'Heading Inject Min Similarity', 'type' => 'number', 'default' => 0.65, 'step' => '0.01',
+		'description' => 'Minimum heading similarity for injecting underrepresented URLs.', 'section' => 'heading' ),
+	'heading_inject_max' => array( 'label' => 'Heading Inject Max URLs', 'type' => 'number', 'default' => 10,
+		'description' => 'Maximum underrepresented URLs to inject.', 'section' => 'heading' ),
+	'heading_inject_min_sents' => array( 'label' => 'Heading Inject Min Sentences', 'type' => 'number', 'default' => 5,
+		'description' => 'URLs with fewer sentences than this are candidates for injection.', 'section' => 'heading' ),
+
+	'top_n_per_section' => array( 'label' => 'Top N per Section', 'type' => 'number', 'default' => 5,
+		'description' => 'Max top-scoring sentences per section for aggregation.', 'section' => 'limits' ),
+	'max_sections_per_url' => array( 'label' => 'Max Sections per URL', 'type' => 'number', 'default' => 3,
+		'description' => 'Prevents one page from monopolizing results.', 'section' => 'limits' ),
+
+	'skip_tool_decision' => array( 'label' => 'Skip Tool Decision', 'type' => 'toggle', 'default' => true,
+		'description' => 'Skip LLM tool-choice step, go directly to retrieval.', 'section' => 'pipeline' ),
+	'max_tool_calls' => array( 'label' => 'Max Tool Calls', 'type' => 'number', 'default' => 1,
+		'description' => 'Max ReAct loop iterations before forcing final answer.', 'section' => 'pipeline' ),
+	'cite_sources' => array( 'label' => 'Cite Sources', 'type' => 'toggle', 'default' => true,
+		'description' => 'LLM cites sources as [1], [2].', 'section' => 'pipeline' ),
+	'use_source_filter' => array( 'label' => 'Use Source Filter', 'type' => 'toggle', 'default' => false,
+		'description' => 'Extra LLM call to filter irrelevant sources.', 'section' => 'pipeline' ),
+	'retrieval_cache_ttl' => array( 'label' => 'Retrieval Cache TTL (sec)', 'type' => 'number', 'default' => 120,
+		'description' => 'Redis cache TTL for repeat queries. 0 = disabled.', 'section' => 'pipeline' ),
+
+	'sentence_highlight_mode' => array( 'label' => 'Sentence Highlight Mode', 'type' => 'select', 'default' => 'multi',
+		'options' => array( 'single' => 'Single (CE picks best)', 'multi' => 'Multi (all matched)' ),
+		'description' => 'How sentences are highlighted in deep links.', 'section' => 'deeplink' ),
+	'deep_link_highlight_mode' => array( 'label' => 'Deep Link Highlight Mode', 'type' => 'select', 'default' => 'sentence',
+		'options' => array( 'sentence' => 'Sentence only', 'paragraph' => 'Full paragraph' ),
+		'description' => 'What text goes into deep link highlight.', 'section' => 'deeplink' ),
+	'use_short_deep_links' => array( 'label' => 'Use Short Deep Links', 'type' => 'toggle', 'default' => false,
+		'description' => 'Use Redis to shorten deep link URLs.', 'section' => 'deeplink' ),
+);
+
+$clw_retrieval_sections = array(
+	'basic'    => 'Basic Retrieval',
+	'reranker' => 'Reranker',
+	'heading'  => 'Heading Boost / Inject',
+	'limits'   => 'Section / URL Limits',
+	'pipeline' => 'Pipeline Flow',
+	'deeplink' => 'Deep Link',
+);
+
+function clw_register_retrieval_settings() {
+	global $clw_retrieval_options, $clw_retrieval_sections;
+
+	register_setting( 'clw_settings_group', 'clw_retrieval_options' );
+
+	foreach ( $clw_retrieval_sections as $key => $title ) {
+		add_settings_section( 'clw_ret_' . $key, $title, '__return_false', 'contextual-link-weaver' );
+	}
+
+	foreach ( $clw_retrieval_options as $opt_key => $opt ) {
+		add_settings_field(
+			'clw_ret_' . $opt_key,
+			$opt['label'],
+			function () use ( $opt_key, $opt ) {
+				$all = get_option( 'clw_retrieval_options', array() );
+				$val = isset( $all[ $opt_key ] ) ? $all[ $opt_key ] : $opt['default'];
+				$name = 'clw_retrieval_options[' . esc_attr( $opt_key ) . ']';
+
+				if ( $opt['type'] === 'select' ) {
+					echo '<select name="' . $name . '">';
+					foreach ( $opt['options'] as $v => $label ) {
+						echo '<option value="' . esc_attr( $v ) . '" ' . selected( $val, $v, false ) . '>' . esc_html( $label ) . '</option>';
+					}
+					echo '</select>';
+				} elseif ( $opt['type'] === 'toggle' ) {
+					echo '<input type="hidden" name="' . $name . '" value="0">';
+					echo '<input type="checkbox" name="' . $name . '" value="1" ' . checked( $val, true, false ) . '>';
+				} elseif ( $opt['type'] === 'number' ) {
+					$step = isset( $opt['step'] ) ? $opt['step'] : '1';
+					echo '<input type="number" step="' . esc_attr( $step ) . '" name="' . $name . '" value="' . esc_attr( $val ) . '" class="small-text">';
+				}
+				if ( ! empty( $opt['description'] ) ) {
+					echo '<p class="description">' . esc_html( $opt['description'] ) . '</p>';
+				}
+			},
+			'contextual-link-weaver',
+			'clw_ret_' . $opt['section']
+		);
+	}
+}
+
+/**
+ * Reads saved retrieval options and returns them as a typed associative array.
+ * Only includes values that differ from NULL (i.e., were explicitly set).
+ */
+function clw_get_retrieval_config() {
+	global $clw_retrieval_options;
+	$saved = get_option( 'clw_retrieval_options', array() );
+	if ( empty( $saved ) || ! is_array( $saved ) ) {
+		return array();
+	}
+	$config = array();
+	foreach ( $saved as $key => $val ) {
+		if ( ! isset( $clw_retrieval_options[ $key ] ) ) {
+			continue;
+		}
+		$def = $clw_retrieval_options[ $key ]['default'];
+		if ( is_bool( $def ) ) {
+			$config[ $key ] = (bool) intval( $val );
+		} elseif ( is_int( $def ) ) {
+			$config[ $key ] = intval( $val );
+		} elseif ( is_float( $def ) ) {
+			$config[ $key ] = floatval( $val );
+		} else {
+			$config[ $key ] = (string) $val;
+		}
+	}
+	return $config;
+}
+
 /**
  * Renders the full settings page HTML.
  *
@@ -257,7 +407,19 @@ function clw_settings_page_html() {
 				</table>
 			</div>
 
-			<?php submit_button( 'Save Settings' ); ?>
+			<div id="clw-retrieval-section">
+			<?php
+			global $clw_retrieval_sections;
+			foreach ( $clw_retrieval_sections as $key => $title ) :
+			?>
+			<h2><?php echo esc_html( $title ); ?></h2>
+			<table class="form-table" role="presentation">
+				<?php do_settings_fields( 'contextual-link-weaver', 'clw_ret_' . $key ); ?>
+			</table>
+			<?php endforeach; ?>
+		</div>
+
+		<?php submit_button( 'Save Settings' ); ?>
 		</form>
 	</div>
 	<?php
@@ -311,6 +473,10 @@ add_action( 'enqueue_block_editor_assets', 'clw_enqueue_editor_assets' );
  * editors and admins can access them. The routes are namespaced
  * under 'contextual-link-weaver/v1'.
  */
+function clw_rest_error( $msg, $status = 500 ) {
+	return new WP_REST_Response( [ 'error' => $msg, 'message' => $msg ], $status );
+}
+
 function clw_register_rest_route() {
 	$permission = function () { return current_user_can( 'edit_posts' ); };
 
@@ -340,39 +506,116 @@ add_action( 'rest_api_init', 'clw_register_rest_route' );
 ||--------------------------------------------------------------------------
 ||
 || Called from the sidebar "Scan Post & Generate" button.
+|| Supports two modes (controlled by the 'mode' request parameter):
 ||
-|| Flow:
-||   1. Receive post content + post_id from the editor
-||   2. Load ALL published posts (excluding current) as {id, title, url}
-||   3. Build an LLM prompt that includes the full post content and post list
-||   4. LLM returns up to 5 suggestions: verbatim anchor_text + post_id_to_link
-||   5. Enrich each suggestion with title/url by cross-referencing the post list
-||   6. Return the enriched array to the JS sidebar
+|| mode=rag (default):
+||   1. LLM identifies up to 5 verbatim anchor phrases
+||   2. Each phrase is sent through the RAG pipeline (chatbot API) in parallel
+||   3. Returns the top-scored source for each phrase
 ||
-|| The prompt enforces strict rules: anchor text must exist verbatim in the
-|| draft, must be 4-6 words, and must not be an article title.
+|| mode=llm:
+||   1. All published posts are loaded as a JSON list
+||   2. LLM identifies anchor phrases AND picks the best target post for each
+||   3. Results are enriched with post title/URL
 ||
 */
 
 /**
- * @param  WP_REST_Request  $request  Must contain 'content' and 'post_id'.
- * @return WP_REST_Response           Array of {anchor_text, post_id_to_link, reasoning, title, url}.
+ * @param  WP_REST_Request  $request  Must contain 'content'. Optional: 'mode' ('rag'|'llm'), 'post_id'.
+ * @return WP_REST_Response           Array of suggestion objects.
  */
 function clw_handle_suggestions_request( WP_REST_Request $request ) {
 	$post_content = $request->get_param( 'content' );
 	if ( empty( $post_content ) ) {
-		return new WP_REST_Response( [ 'error' => 'Content is empty.' ], 400 );
+		return clw_rest_error( 'Content is empty.', 400 );
 	}
 
+	$mode = $request->get_param( 'mode' ) ?: 'rag';
+
+	if ( $mode === 'llm' ) {
+		$current_post_id = $request->get_param( 'post_id' );
+		return clw_suggestions_llm_only( $post_content, $current_post_id );
+	}
+
+	return clw_suggestions_rag( $post_content );
+}
+
+/**
+ * LLM + RAG mode: LLM identifies phrases, then parallel RAG calls find best source for each.
+ *
+ * @param  string           $post_content  The post HTML content.
+ * @return WP_REST_Response                Array of {anchor_text, reasoning, title, url, deep_link_url, text}.
+ */
+function clw_suggestions_rag( $post_content ) {
+	$base_url = rtrim( get_option( 'clw_rag_api_url', '' ), '/' );
+	if ( empty( $base_url ) ) {
+		return clw_rest_error( 'RAG Chatbot API URL is not configured.' );
+	}
+
+	$prompt = "You are an expert SEO. Analyze the following article and identify up to 5 phrases that would be excellent anchor texts for internal links to related content.
+
+Here is the article:
+---
+{$post_content}
+---
+
+Follow these rules STRICTLY:
+1. The 'anchor_text' MUST be a phrase that exists verbatim in the article. Do NOT invent or summarize.
+2. The 'anchor_text' MUST be between 4 and 6 words long.
+3. The phrase should be self-contained and natural-sounding.
+4. Choose phrases that represent distinct topics or concepts worth linking to.
+
+Return ONLY a JSON object: {\"suggestions\": [{\"anchor_text\": \"...\", \"reasoning\": \"...\"}]}. If no good phrases exist, return {\"suggestions\": []}.";
+
+	$llm_result = clw_get_linking_suggestions( $prompt );
+
+	if ( is_wp_error( $llm_result ) ) {
+		return clw_rest_error( $llm_result->get_error_message() );
+	}
+
+	if ( ! is_array( $llm_result ) ) {
+		return clw_rest_error( 'LLM returned a non-array response.' );
+	}
+
+	if ( isset( $llm_result['suggestions'] ) && is_array( $llm_result['suggestions'] ) ) {
+		$llm_result = $llm_result['suggestions'];
+	}
+
+	if ( empty( $llm_result ) ) {
+		return new WP_REST_Response( [], 200 );
+	}
+
+	$phrases = [];
+	foreach ( $llm_result as $suggestion ) {
+		if ( ! empty( $suggestion['anchor_text'] ) ) {
+			$phrases[] = $suggestion;
+		}
+	}
+
+	if ( empty( $phrases ) ) {
+		return new WP_REST_Response( [], 200 );
+	}
+
+	$rag_results = clw_parallel_rag_lookup( $phrases, $base_url );
+
+	return new WP_REST_Response( $rag_results, 200 );
+}
+
+/**
+ * LLM-only mode: LLM identifies anchor phrases AND picks target posts from the WP post list.
+ *
+ * @param  string           $post_content     The post HTML content.
+ * @param  int|null         $current_post_id  The current post ID (excluded from suggestions).
+ * @return WP_REST_Response                   Array of {anchor_text, reasoning, title, url}.
+ */
+function clw_suggestions_llm_only( $post_content, $current_post_id ) {
 	$posts = get_posts( [
 		'numberposts' => -1,
 		'post_status' => 'publish',
 		'post_type'   => 'post',
 	] );
 
-	$post_list       = [];
-	$current_post_id = $request->get_param( 'post_id' );
-
+	$post_list = [];
 	foreach ( $posts as $post ) {
 		if ( $post->ID == $current_post_id ) {
 			continue;
@@ -385,7 +628,7 @@ function clw_handle_suggestions_request( WP_REST_Request $request ) {
 	}
 
 	if ( empty( $post_list ) ) {
-		return new WP_REST_Response( [ 'error' => 'No other published posts available to link to.' ], 400 );
+		return clw_rest_error( 'No other published posts available to link to.', 400 );
 	}
 
 	$post_list_json = wp_json_encode( $post_list );
@@ -412,11 +655,11 @@ function clw_handle_suggestions_request( WP_REST_Request $request ) {
 	$suggestions_from_api = clw_get_linking_suggestions( $prompt );
 
 	if ( is_wp_error( $suggestions_from_api ) ) {
-		return new WP_REST_Response( [ 'error' => $suggestions_from_api->get_error_message() ], 500 );
+		return clw_rest_error( $suggestions_from_api->get_error_message() );
 	}
 
 	if ( ! is_array( $suggestions_from_api ) ) {
-		return new WP_REST_Response( [ 'error' => 'API returned a non-array response.' ], 500 );
+		return clw_rest_error( 'API returned a non-array response.' );
 	}
 
 	if ( isset( $suggestions_from_api['suggestions'] ) && is_array( $suggestions_from_api['suggestions'] ) ) {
@@ -436,6 +679,125 @@ function clw_handle_suggestions_request( WP_REST_Request $request ) {
 	}
 
 	return new WP_REST_Response( $final_suggestions, 200 );
+}
+
+/**
+ * Sends multiple phrases through the RAG pipeline in parallel using curl_multi.
+ *
+ * Two rounds of parallel HTTP calls:
+ *   Round 1: POST /api/conversation/get_id for each phrase (get conversation IDs)
+ *   Round 2: POST /api/chat/{id} for each phrase (get RAG sources)
+ *
+ * From each chat response, takes sources[0] (best reranker score).
+ *
+ * @param  array   $phrases   Array of {anchor_text, reasoning} from the LLM.
+ * @param  string  $base_url  Chatbot API base URL (no trailing slash).
+ * @return array              Array of {anchor_text, reasoning, title, url, deep_link_url, text}.
+ */
+function clw_parallel_rag_lookup( $phrases, $base_url ) {
+	$mh      = curl_multi_init();
+	$handles = [];
+
+	foreach ( $phrases as $i => $phrase ) {
+		$ch = curl_init( $base_url . '/api/conversation/get_id' );
+		curl_setopt_array( $ch, [
+			CURLOPT_POST           => true,
+			CURLOPT_POSTFIELDS     => '{"conversation_id": null}',
+			CURLOPT_HTTPHEADER     => [ 'Content-Type: application/json' ],
+			CURLOPT_RETURNTRANSFER => true,
+			CURLOPT_TIMEOUT        => 15,
+		] );
+		curl_multi_add_handle( $mh, $ch );
+		$handles[ $i ] = $ch;
+	}
+
+	do {
+		$status = curl_multi_exec( $mh, $active );
+		if ( $active ) {
+			curl_multi_select( $mh );
+		}
+	} while ( $active && $status === CURLM_OK );
+
+	$conversation_ids = [];
+	foreach ( $handles as $i => $ch ) {
+		$body = curl_multi_getcontent( $ch );
+		$data = json_decode( $body, true );
+		$conversation_ids[ $i ] = $data['conversationId'] ?? null;
+		curl_multi_remove_handle( $mh, $ch );
+		curl_close( $ch );
+	}
+	curl_multi_close( $mh );
+
+	$retrieval_config = clw_get_retrieval_config();
+
+	$mh      = curl_multi_init();
+	$handles = [];
+
+	foreach ( $phrases as $i => $phrase ) {
+		if ( empty( $conversation_ids[ $i ] ) ) {
+			continue;
+		}
+
+		$payload = [
+			'user_ip'   => '127.0.0.1',
+			'message'   => $phrase['anchor_text'],
+			'user_type' => 'general',
+		];
+		if ( ! empty( $retrieval_config ) ) {
+			$payload['retrieval_config'] = $retrieval_config;
+		}
+
+		$ch = curl_init( $base_url . '/api/chat/' . $conversation_ids[ $i ] );
+		curl_setopt_array( $ch, [
+			CURLOPT_POST           => true,
+			CURLOPT_POSTFIELDS     => json_encode( $payload ),
+			CURLOPT_HTTPHEADER     => [ 'Content-Type: application/json' ],
+			CURLOPT_RETURNTRANSFER => true,
+			CURLOPT_TIMEOUT        => 60,
+		] );
+		curl_multi_add_handle( $mh, $ch );
+		$handles[ $i ] = $ch;
+	}
+
+	do {
+		$status = curl_multi_exec( $mh, $active );
+		if ( $active ) {
+			curl_multi_select( $mh );
+		}
+	} while ( $active && $status === CURLM_OK );
+
+	$final = [];
+	foreach ( $handles as $i => $ch ) {
+		$http_code = curl_getinfo( $ch, CURLINFO_HTTP_CODE );
+		$body      = curl_multi_getcontent( $ch );
+		curl_multi_remove_handle( $mh, $ch );
+		curl_close( $ch );
+
+		if ( $http_code !== 200 ) {
+			continue;
+		}
+
+		$data    = json_decode( $body, true );
+		$sources = $data['sources'] ?? [];
+
+		if ( empty( $sources ) ) {
+			continue;
+		}
+
+		$best = $sources[0];
+
+		$final[] = [
+			'anchor_text'   => $phrases[ $i ]['anchor_text'],
+			'reasoning'     => $phrases[ $i ]['reasoning'] ?? '',
+			'title'         => $best['title'] ?? $best['name'] ?? '',
+			'url'           => $best['url'] ?? '',
+			'deep_link_url' => $best['deep_link_url'] ?? '',
+			'text'          => mb_substr( $best['text'] ?? '', 0, 200 ),
+		];
+	}
+	curl_multi_close( $mh );
+
+	return $final;
 }
 
 /*
@@ -460,7 +822,7 @@ function clw_handle_link_for_text_request( WP_REST_Request $request ) {
 	$current_post_id = $request->get_param( 'post_id' );
 
 	if ( empty( $anchor_text ) ) {
-		return new WP_REST_Response( [ 'error' => 'anchor_text is required.' ], 400 );
+		return clw_rest_error( 'anchor_text is required.', 400 );
 	}
 
 	$posts = get_posts( [
@@ -500,11 +862,11 @@ function clw_handle_link_for_text_request( WP_REST_Request $request ) {
 	$result = clw_get_linking_suggestions( $prompt );
 
 	if ( is_wp_error( $result ) ) {
-		return new WP_REST_Response( [ 'error' => $result->get_error_message() ], 500 );
+		return clw_rest_error( $result->get_error_message() );
 	}
 
 	if ( ! is_array( $result ) ) {
-		return new WP_REST_Response( [ 'error' => 'Invalid API response.' ], 500 );
+		return clw_rest_error( 'Invalid API response.' );
 	}
 
 	if ( isset( $result['suggestions'] ) && is_array( $result['suggestions'] ) ) {
@@ -555,12 +917,12 @@ function clw_handle_link_for_text_request( WP_REST_Request $request ) {
 function clw_handle_link_from_rag_request( WP_REST_Request $request ) {
 	$query = trim( $request->get_param( 'query' ) );
 	if ( empty( $query ) ) {
-		return new WP_REST_Response( [ 'error' => 'query is required.' ], 400 );
+		return clw_rest_error( 'query is required.', 400 );
 	}
 
 	$base_url = rtrim( get_option( 'clw_rag_api_url', '' ), '/' );
 	if ( empty( $base_url ) ) {
-		return new WP_REST_Response( [ 'error' => 'RAG Chatbot API URL is not configured.' ], 500 );
+		return clw_rest_error( 'RAG Chatbot API URL is not configured.' );
 	}
 
 	$conv_response = wp_remote_post( $base_url . '/api/conversation/get_id', [
@@ -570,33 +932,45 @@ function clw_handle_link_from_rag_request( WP_REST_Request $request ) {
 	] );
 
 	if ( is_wp_error( $conv_response ) ) {
-		return new WP_REST_Response( [ 'error' => 'Failed to connect to chatbot API: ' . $conv_response->get_error_message() ], 500 );
+		return clw_rest_error( 'Failed to connect to chatbot API: ' . $conv_response->get_error_message() );
 	}
 
 	$conv_data       = json_decode( wp_remote_retrieve_body( $conv_response ), true );
 	$conversation_id = $conv_data['conversationId'] ?? null;
 
 	if ( ! $conversation_id ) {
-		return new WP_REST_Response( [ 'error' => 'Could not obtain conversation ID from chatbot API.' ], 500 );
+		return clw_rest_error( 'Could not obtain conversation ID from chatbot API.' );
+	}
+
+	$chat_payload = [
+		'user_ip'   => '127.0.0.1',
+		'message'   => $query,
+		'user_type' => 'general',
+	];
+	$retrieval_config = clw_get_retrieval_config();
+	if ( ! empty( $retrieval_config ) ) {
+		$chat_payload['retrieval_config'] = $retrieval_config;
 	}
 
 	$chat_response = wp_remote_post( $base_url . '/api/chat/' . $conversation_id, [
 		'headers' => [ 'Content-Type' => 'application/json' ],
-		'body'    => wp_json_encode( [
-			'user_ip'   => '127.0.0.1',
-			'message'   => $query,
-			'user_type' => 'general',
-		] ),
+		'body'    => wp_json_encode( $chat_payload ),
 		'timeout' => 60,
 	] );
 
 	if ( is_wp_error( $chat_response ) ) {
-		return new WP_REST_Response( [ 'error' => 'Chatbot API request failed: ' . $chat_response->get_error_message() ], 500 );
+		return clw_rest_error( 'Chatbot API request failed: ' . $chat_response->get_error_message() );
 	}
 
 	$status = wp_remote_retrieve_response_code( $chat_response );
 	if ( $status !== 200 ) {
-		return new WP_REST_Response( [ 'error' => "Chatbot API returned status {$status}." ], 500 );
+		$body   = wp_remote_retrieve_body( $chat_response );
+		$detail = '';
+		$parsed = json_decode( $body, true );
+		if ( ! empty( $parsed['errors'] ) ) {
+			$detail = ' — ' . implode( '; ', (array) $parsed['errors'] );
+		}
+		return clw_rest_error( "Chatbot API returned status {$status}{$detail}." );
 	}
 
 	$chat_data = json_decode( wp_remote_retrieve_body( $chat_response ), true );
